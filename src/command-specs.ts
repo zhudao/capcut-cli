@@ -236,7 +236,7 @@ const usages = {
   prune: "capcut prune <project>",
   register: "capcut register <project-dir> [--apply] [--materials] [--drafts <dir>]",
   rename: "capcut rename <project> <new-name> [--drafts <dir>]",
-  relink: "capcut relink <project> (--dir <path> | --from <prefix> --to <prefix>) [--stage]",
+  relink: "capcut relink <project> (--dir <path> [--recursive] | --from <prefix> --to <prefix>) [--stage]",
   timeline: "capcut timeline <project> [--cols <number>]",
   projects: "capcut projects [query] [--drafts <path>] [--names]",
   diff: "capcut diff <project-a> <project-b>",
@@ -691,7 +691,18 @@ const optionsByCommand: Record<string, OptionSpec[]> = {
     option("effect_id", ["--effect-id"], "string", "Effect id for an --add entry that carries both ids."),
   ],
   relink: [
-    option("dir", ["--dir"], "path", "Directory containing replacement files."),
+    option(
+      "dir",
+      ["--dir"],
+      "path",
+      "Directory containing replacement files; ambiguous basenames are reported and left unchanged.",
+    ),
+    option(
+      "recursive",
+      ["--recursive"],
+      "boolean",
+      "Search nested directories under --dir; directory symlinks are not followed.",
+    ),
     option("from", ["--from"], "path", "Old path prefix."),
     option("to", ["--to"], "path", "New path prefix."),
     option(
@@ -726,7 +737,8 @@ const optionsByCommand: Record<string, OptionSpec[]> = {
       "boolean",
       "Scan the finished bundle (SANITIZE_REPORT.json and README included) for residual home paths, emails, " +
         "device ids and the account name, reporting file:line per finding and exiting non-zero on any. " +
-        "With only a bundle directory as the argument, re-checks an existing bundle without rebuilding.",
+        "New bundles are checked automatically. With only a bundle directory as the argument, " +
+        "re-checks an existing bundle without rebuilding.",
     ),
   ],
   "sync-timelines": [
@@ -734,7 +746,8 @@ const optionsByCommand: Record<string, OptionSpec[]> = {
       "apply",
       ["--apply"],
       "boolean",
-      "Rewrite only the drifted mirror files from draft_content.json (default: print the plan only).",
+      "Rewrite only the drifted mirrors from the canonical timeline (default: print the plan only). " +
+        "On the evidenced Windows 8.7.0 active layout, the selected nested document is canonical.",
     ),
     option(
       "nested",
@@ -742,7 +755,8 @@ const optionsByCommand: Record<string, OptionSpec[]> = {
       "boolean",
       "Also reconcile the nested Timelines/<id>/ documents (draft_info.json, draft_content.json, template-2.tmp), " +
         "each keeping its own GUID — the workaround verified on CapCut Mac 9.2.8 in issue #50, as an explicit opt-in. " +
-        "Timelines/project.json is never touched.",
+        "On Windows 8.7.0 active layouts only the selected timeline and root mirrors are reconciled, " +
+        "even with this flag. Timelines/project.json is never touched.",
     ),
   ],
   "replace-media": [
@@ -928,6 +942,7 @@ optionsByCommand["image-anim"] = optionsByCommand["text-anim"];
 //   --word-reveal, --min-script-match, --audio-stream -> caption (v0.26 caption controls)
 //   --from -> shift-all; --ripple -> remove (v0.26 boundary-safe ripple editing)
 //   --frame-grid -> lint (v0.26 exact integer timeline preflight)
+//   --recursive -> relink (v0.27 nested media search)
 // Everywhere else they fall through to the positional stream verbatim, matching
 // pre-release behaviour where these tokens were unknown and preserved.
 export const RELEASE_SCOPED_FLAGS: ReadonlySet<string> = new Set([
@@ -973,6 +988,7 @@ export const RELEASE_SCOPED_FLAGS: ReadonlySet<string> = new Set([
   "--pad",
   "--pip",
   "--stage",
+  "--recursive",
   "--preset",
   "--ratio",
   "--rect",

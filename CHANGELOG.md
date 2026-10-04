@@ -4,6 +4,31 @@ All notable changes to capcut-cli are documented here. The format follows [Keep 
 
 ## [Unreleased]
 
+## [0.27.0] — 2026-10-03
+
+### Added
+
+- `relink --dir <folder> --recursive` searches nested media folders. Duplicate basenames are reported in `ambiguous` and left unchanged; prefix remapping matches whole path components, and directory symlinks are not followed.
+
+### Fixed
+
+- `replace-media` stages the requested bytes even when a different file with the same basename already exists. Occupied hash filenames are checked by content; dry runs create no asset directories or files, and directories/non-media segments are rejected before mutation.
+- Replacement and relink refresh changed media's `local_material_id` links and imported-media entries when a readable `draft_meta_info.json` exists. Sidecar and timeline writes share conflict checks, backups, and rollback; existing and unrelated import entries are preserved. Bare timelines still use `register --materials --apply` to create registration metadata.
+- `compile` derives target durations from rounded start and end boundaries, keeping adjacent fractional-second clips contiguous across text, video, audio, photos, and timed operations.
+- Compile operation payloads are checked with the same builders used by real writes before creating output. Failed builds remove only the output directory created by that invocation; successful builds register in the project index after the draft is saved.
+- `serve` binds a job ID to its effective command payload and execution settings. Identical submissions still deduplicate; reusing an ID for a different job returns a failure without executing the conflicting job.
+- Queue project locks resolve project roots, relative paths, timeline files, and symlink aliases so concurrent writers to the same project serialize.
+- Queue input and limits reject malformed or non-finite values. Combined child output is checked again at exit before reading it, so a fast process cannot bypass the configured capture threshold. Overflow results omit captured output; the threshold is polled during execution and is not a hard disk quota.
+- `import-timeline` resolves relative media references against the OTIO document's directory and decodes local `file:` URLs, including escaped spaces. Remote URLs and inaccessible references remain placeholders.
+
+## [0.26.1] — 2026-10-03
+
+### Fixed
+
+- `fixture` redacts JSON-escaped Windows home paths, including paths inside JSON strings (#134). Every new bundle automatically runs the existing residual-value check; the CLI exits nonzero and `SANITIZE_REPORT.json` records failure if a recognizable leak remains. `fixture <bundle> --check` still verifies an existing bundle.
+- `compile` resolves ratio-only and explicit-dimension canvases through the same resolver as `init` and `quickstart`, including `--check`. Video/audio material and registration durations use the full probed source duration while segments retain their requested durations and in-points. Source ranges, including speed, are validated before any draft is created (#133).
+- On the fixture-backed CapCut 8.7.0 Windows layout, reads follow the validated `Timelines/project.json` active pointer. Normal writes synchronize that document, its readable mirrors, and the readable root mirrors through the transactional write path, preserving document IDs and other timelines. `sync-timelines` uses active → root on this layout, including with `--nested`; existing divergent root edits remain visible in its plan and newer-mirror gate. Assets and metadata remain at the project root. Other versions/OSes keep their prior selection behavior; a patched app round-trip remains pending (#50).
+
 ## [0.26.0] — 2026-09-25
 
 ### Added

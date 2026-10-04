@@ -59,9 +59,12 @@ import type { LintOptions } from "./lint.js";
 import type { TextStylePreset } from "./preset.js";
 import type { SegmentCue } from "./srt.js";
 import {
+  ACTIVE_TIMELINE_WINDOWS_ACTION,
+  assertActiveTimelineUnchanged,
   defaultDraftsDir,
   diagnoseDraftStore,
   discoverDraftStore,
+  draftProjectDir,
   editorProcesses,
   NESTED_TIMELINES_MODERN_ACTION,
   nestedTimelinesAction,
@@ -1057,6 +1060,7 @@ interface Flags {
   version?: boolean;
   // relink / projects / timeline / restore
   dir?: string;
+  recursive?: boolean;
   step?: number;
   list?: boolean;
   cols?: number;
@@ -1456,15 +1460,17 @@ function parseFlags(args: string[]): { positional: string[]; flags: Flags } {
     } else if (a === "--fail-fast") {
       flags.failFast = true;
     } else if (a === "--workers" && i + 1 < args.length) {
-      flags.workers = parseInt(args[++i], 10);
+      flags.workers = Number(args[++i]);
     } else if (a === "--retries" && i + 1 < args.length) {
-      flags.retries = parseInt(args[++i], 10);
+      flags.retries = Number(args[++i]);
     } else if (a === "--timeout" && i + 1 < args.length) {
-      flags.timeoutMs = parseInt(args[++i], 10);
+      flags.timeoutMs = Number(args[++i]);
     } else if (a === "--backoff-ms" && i + 1 < args.length) {
-      flags.backoffMs = parseInt(args[++i], 10);
+      flags.backoffMs = Number(args[++i]);
     } else if (a === "--max-buffer-mb" && i + 1 < args.length) {
-      flags.maxBufferMb = parseFloat(args[++i]);
+      flags.maxBufferMb = Number(args[++i]);
+    } else if (a === "--recursive") {
+      flags.recursive = true;
     } else if (a === "--dir" && i + 1 < args.length) {
       flags.dir = args[++i];
     } else if (a === "--step" && i + 1 < args.length) {
@@ -2305,7 +2311,7 @@ async function cmdImportTimeline(positional: string[], flags: Flags): Promise<vo
   }
   let plan: ImportPlan;
   try {
-    plan = otioToImportPlan(doc);
+    plan = otioToImportPlan(doc, { mediaDir: path.dirname(path.resolve(otioPath)) });
   } catch (e) {
     die((e as Error).message);
   }
@@ -2333,7 +2339,7 @@ async function cmdImportTimeline(positional: string[], flags: Flags): Promise<vo
     draft.fps = plan.rate;
   } else {
     ({ draft, filePath } = loadDraft(flags.into as string));
-    draftPath = path.dirname(filePath);
+    draftPath = draftProjectDir(filePath);
   }
 
   const applied = await applyImportPlan(draft, filePath, plan);
@@ -2682,7 +2688,7 @@ async function cmdTts(draft: Draft, filePath: string, positional: string[], flag
   const durationStr = positional[3];
   // Synthesize straight into the dir addAudio copies into (like the Wikimedia
   // fetch path) so its copyAssetDeduped becomes a no-op on the same file.
-  const assetsDir = path.resolve(path.dirname(filePath), "assets", "audio");
+  const assetsDir = path.resolve(draftProjectDir(filePath), "assets", "audio");
   const outPath = collisionSafeOutPath(assetsDir);
   const synthesis = synthesizeSpeech(text, flags.ttsCmd, outPath);
   const media = flags.noProbe ? null : probeMedia(outPath, flags.ffprobeCmd);
@@ -3771,7 +3777,8 @@ function cmdVersion(draft: Draft, filePath: string, flags: Flags): void {
   // discarded by the app — name the layout alongside the write-guard notes.
   // On >= 8.7 storage the layout value stays content-/info-primary by design,
   // so the same question needs the claim-free note instead of silence.
-  if (store.layout === "timelines-nested") v.support.notes.push(nestedTimelinesAction(store.version));
+  if (store.activeTimeline) v.support.notes.push(ACTIVE_TIMELINE_WINDOWS_ACTION);
+  else if (store.layout === "timelines-nested") v.support.notes.push(nestedTimelinesAction(store.version));
   else if (store.nestedTimelines.length > 0) v.support.notes.push(NESTED_TIMELINES_MODERN_ACTION);
   if (flags.human) {
     console.log(`App:          ${v.app}${v.app_source !== "unknown" ? ` (${v.app_source})` : ""}`);
@@ -3825,7 +3832,7 @@ async function cmdLint(draft: Draft, filePath: string, flags: Flags): Promise<{ 
     checkLocalPaths: flags.noCheckPaths ? false : DEFAULT_LINT_OPTIONS.checkLocalPaths,
     probeMedia: flags.noProbe ? false : DEFAULT_LINT_OPTIONS.probeMedia,
     ffprobeCmd: flags.ffprobeCmd,
-    draftDir: path.dirname(path.resolve(filePath)),
+    draftDir: draftProjectDir(filePath),
     dryRun: isDryRun(),
     frameGrid: flags.frameGrid,
   };
@@ -3846,7 +3853,7 @@ async function cmdLint(draft: Draft, filePath: string, flags: Flags): Promise<{ 
       d.last_modified_platform === undefined;
     if (markerless) {
       const { isManagedDraftPath } = await import("./store.js");
-      const storeDir = path.dirname(path.dirname(path.resolve(filePath)));
+      const storeDir = path.dirname(draftProjectDir(filePath));
       const inStore =
         existsSync(path.join(storeDir, "root_meta_info.json")) || isManagedDraftPath(path.resolve(filePath));
       if (inStore) {
@@ -3854,7 +3861,7 @@ async function cmdLint(draft: Draft, filePath: string, flags: Flags): Promise<{ 
         // The linted draft is no evidence about its own store: excluded, so a
         // bundled-template draft alone in a JianYing store is not its own
         // "readable 6.5.0 project".
-        const scan = scanStore(storeDir, { exclude: path.dirname(path.resolve(filePath)) });
+        const scan = scanStore(storeDir, { exclude: draftProjectDir(filePath) });
         opts.storeAppVersion = scan.newestVersion;
         opts.storeEncryptedProjects = scan.store.encrypted;
       }
@@ -4030,7 +4037,7 @@ async function cmdMigrate(draft: Draft, filePath: string, flags: Flags): Promise
   // the way init's seeding does.
   if (flags.like !== undefined || flags.fromStore) {
     if (flags.like !== undefined && flags.fromStore) die("--like and --from-store are mutually exclusive.");
-    const projectDir = path.dirname(path.resolve(filePath));
+    const projectDir = draftProjectDir(filePath);
     let donorPath: string;
     if (flags.like !== undefined) {
       donorPath = path.resolve(flags.like);
@@ -4175,7 +4182,7 @@ async function cmdServe(flags: Flags): Promise<void> {
     retries: flags.retries,
     timeoutMs: flags.timeoutMs,
     backoffMs: flags.backoffMs,
-    maxBufferBytes: flags.maxBufferMb ? Math.round(flags.maxBufferMb * 1024 * 1024) : undefined,
+    maxBufferBytes: flags.maxBufferMb === undefined ? undefined : flags.maxBufferMb * 1024 * 1024,
   });
   // Write a final summary line at end (JSON only, stderr to avoid mixing with per-job results)
   process.stderr.write(`${JSON.stringify({ summary: result })}\n`);
@@ -4587,10 +4594,8 @@ async function cmdRename(positional: string[], flags: Flags): Promise<number> {
 // 0 ok, 1 via die(), 2 when a mirror exists that the CLI cannot reconcile.
 function cmdSyncTimelines(projectPath: string | undefined, flags: Flags): number {
   if (!projectPath) die("Usage: capcut sync-timelines <project-dir> [--nested] [--apply] [--force-write]");
-  const { plan, canonicalDraft, canonicalCandidate, driftedCandidates, nestedDriftedCandidates } = planTimelineSync(
-    projectPath,
-    { nested: flags.nested === true },
-  );
+  const { store, plan, canonicalDraft, canonicalCandidate, driftedCandidates, nestedDriftedCandidates } =
+    planTimelineSync(projectPath, { nested: flags.nested === true });
 
   const warnUnreconcilable = (): void => {
     if (flags.quiet) return;
@@ -4738,6 +4743,7 @@ function cmdSyncTimelines(projectPath: string | undefined, flags: Flags): number
   // Optimistic concurrency: neither the canonical source nor a mirror we are
   // about to rewrite may have changed on disk between the plan read and now.
   const nestedCandidates = nestedDriftedCandidates.map((entry) => entry.candidate);
+  assertActiveTimelineUnchanged(store);
   if (!flags.forceWrite) assertTargetsUnchangedOnDisk([canonicalCandidate, ...driftedCandidates, ...nestedCandidates]);
   commitDraftTargets(driftedCandidates, canonicalDraft);
   // Nested documents keep their own GUID (issue #50's verified 9.2.8 workaround
@@ -4907,80 +4913,29 @@ async function cmdPrune(draft: Draft, filePath: string, flags: Flags): Promise<v
 //   --dir <d>          for each material whose path is missing, look for a file
 //                      with the same basename in <d> and repoint to it.
 //   --from <p> --to <q> prefix-replace on every material path.
+async function saveChangedMedia(draft: Draft, filePath: string, ids: string[]): Promise<void> {
+  const { planChangedMediaRegistration } = await import("./materials-register.js");
+  const sidecar = planChangedMediaRegistration(draft, draftProjectDir(filePath), ids);
+  saveDraft(filePath, draft, { additionalFiles: sidecar ? [sidecar] : [] });
+}
+
 async function cmdRelink(draft: Draft, filePath: string, flags: Flags): Promise<void> {
-  if (!flags.dir && !(flags.from && flags.to)) {
-    die("Usage: capcut relink <project> (--dir <folder> | --from <oldPrefix> --to <newPrefix>) [--stage]");
-  }
-  const { copyAssetDeduped } = await import("./factory.js");
-  const dirIndex = new Map<string, string>();
-  if (flags.dir) {
-    if (!existsSync(flags.dir)) die(`--dir not found: ${flags.dir}`);
-    for (const f of readdirSync(flags.dir)) dirIndex.set(path.basename(f), path.join(flags.dir as string, f));
-  }
-  const draftDir = path.dirname(path.resolve(filePath));
-  const relinked: Array<{ id: string; from: string; to: string; staged: boolean }> = [];
-  let missing = 0;
-  let ok = 0;
-  let staged = 0;
-  for (const [kind, arr] of Object.entries(draft.materials)) {
-    if (!Array.isArray(arr)) continue;
-    for (const m of arr) {
-      const mat = m as { id?: string; path?: unknown; material_name?: unknown; name?: unknown };
-      if (typeof mat.path !== "string" || mat.path === "") continue;
-      let p = mat.path;
-      let changed = false;
-      if (flags.from && flags.to && p.startsWith(flags.from)) {
-        p = flags.to + p.slice(flags.from.length);
-        changed = true;
-      }
-      if (!existsSync(p) && flags.dir) {
-        const hit = dirIndex.get(path.basename(p));
-        if (hit) {
-          p = hit;
-          changed = true;
-        }
-      }
-      // --stage: copy the file this run just relinked into assets/<kind>/ and
-      // point the material at the copy — the repaired draft leaves portable
-      // (pyJianYingDraft#177: a draft whose media lives outside the project
-      // folder black-screens when the folder moves machines). Same
-      // copyAssetDeduped path add-video/add-audio use, so re-runs are no-ops.
-      // A file copy is a side effect no draft write rolls back, so --dry-run
-      // skips the copy and the plan keeps the resolved external path.
-      let didStage = false;
-      if (
-        changed &&
-        flags.stage &&
-        !isDryRun() &&
-        (kind === "videos" || kind === "audios") &&
-        existsSync(p) &&
-        !path.resolve(p).startsWith(draftDir + path.sep)
-      ) {
-        const assetKind = kind === "audios" ? "audio" : "video";
-        const destPath = copyAssetDeduped(
-          p,
-          path.resolve(draftDir, "assets", assetKind),
-          assetKind === "audio" ? "audio.mp3" : "media",
-        );
-        p = destPath;
-        didStage = true;
-        staged++;
-        // Keep the display-name fields tracking the staged file, the
-        // replace-media convention — only visible when de-collision renamed.
-        const filename = path.basename(destPath);
-        if ("material_name" in mat) mat.material_name = filename;
-        if ("name" in mat) mat.name = filename;
-      }
-      if (changed && p !== mat.path) {
-        relinked.push({ id: mat.id ?? "", from: mat.path, to: p, staged: didStage });
-        mat.path = p;
-      }
-      if (existsSync(p)) ok++;
-      else missing++;
-    }
-  }
-  if (relinked.length > 0) saveDraft(filePath, draft);
-  out({ ok: true, relinked: relinked.length, staged, still_missing: missing, present: ok, changes: relinked }, flags);
+  const { relinkMedia } = await import("./relink.js");
+  const result = relinkMedia(draft, filePath, {
+    dir: flags.dir,
+    from: flags.from,
+    to: flags.to,
+    recursive: flags.recursive,
+    stage: flags.stage,
+    dryRun: isDryRun(),
+  });
+  if (result.relinked > 0)
+    await saveChangedMedia(
+      draft,
+      filePath,
+      result.changes.map((change) => change.id),
+    );
+  out(result, flags);
 }
 
 // `replace-media` swaps a segment's source file in place (placeholder > final),
@@ -4994,7 +4949,7 @@ async function cmdReplaceMedia(draft: Draft, filePath: string, positional: strin
     retime: flags.retime,
     dryRun: isDryRun(),
   });
-  saveDraft(filePath, draft); // no-ops under --dry-run
+  await saveChangedMedia(draft, filePath, [result.material_id]); // no-ops under --dry-run
   out(result, flags);
   if (!flags.quiet && result.warning) process.stderr.write(`Warning: ${result.warning}\n`);
 }
@@ -5614,7 +5569,10 @@ async function cmdRender(draft: Draft, filePath: string, flags: Flags): Promise<
   };
   if (opts.dryRun) {
     // Build-only: surface the plan; no ffmpeg needed.
-    const plan = buildRenderPlan(draft, { ...opts, out: opts.out ?? path.join(path.dirname(filePath), "preview.mp4") });
+    const plan = buildRenderPlan(draft, {
+      ...opts,
+      out: opts.out ?? path.join(draftProjectDir(filePath), "preview.mp4"),
+    });
     out({ ok: true, executed: false, ...plan }, flags);
     return;
   }
@@ -5928,15 +5886,19 @@ async function main(): Promise<void> {
     // Scan the real output path from the flag: report.out_dir is itself
     // redacted (a home-dir project reports /home/USER/…), so it is display
     // data, not a filesystem path.
-    const check = flags.check ? verifyBundleRedaction(path.resolve(flags.out)) : null;
-    out(check ? { ...report, ok: report.ok && check.ok, redaction_check: check } : report, flags);
+    const check = report.redaction_check;
+    out(report, flags);
     if (!flags.quiet) {
       const total = Object.values(report.redaction_kinds).reduce((a, b) => a + b, 0);
       process.stderr.write(`Sanitized bundle: ${report.out_dir} (${report.files.length} files, ${total} redactions)\n`);
-      process.stderr.write(`Review the files, then attach the folder to issue #35.\n`);
+      process.stderr.write(
+        check.ok
+          ? "Review the files, then attach the folder to the relevant issue.\n"
+          : "Review the redaction findings before sharing this bundle.\n",
+      );
     }
-    if (check) printCheck(check);
-    process.exit(check && !check.ok ? 1 : 0);
+    printCheck(check);
+    process.exit(check.ok ? 0 : 1);
   }
 
   // `register` reads draft_content.json directly — no loadDraft: the draft may
