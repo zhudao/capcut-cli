@@ -4,6 +4,10 @@ All notable changes to capcut-cli are documented here. The format follows [Keep 
 
 ## [Unreleased]
 
+### Added
+
+- `test/fixtures/jianying-9-0-0-windows/` — a real JianYing 9.0.0 (Windows) project captured after the app opened a tool-written draft: the plaintext `draft_info.json` primary alongside the `draft_content.json` / `template-2.tmp` / `draft_meta_info.json` mirrors the app rewrote into encrypted blobs, plus the materialised `Timelines/` layout. A regression test pins that the encrypted mirrors are reported as unparseable rather than breaking canonical selection, and `docs/version-support.md` gains a JianYing 9.0.0 (Windows) row (evidence: reported; storage shape fixture-backed). The write guard is deliberately unchanged — one machine's capture is not a round-trip claim.
+
 ## [0.29.0] — 2026-10-09
 
 ### Added
