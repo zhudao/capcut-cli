@@ -16,9 +16,11 @@ import type { AssEvent, AssStyleDef } from "./ass.js";
 import { parseJsonObject, stripBom } from "./bom.js";
 import {
   buildCommandSpecs,
+  type CommandSpec,
   commandDeclaresFlag,
   completionWords,
   GLOBAL_OPTION_SPECS,
+  type OptionSpec,
   RELEASE_SCOPED_FLAGS,
   renderCommandIndex,
 } from "./command-specs.js";
@@ -45,10 +47,8 @@ import {
   getMaterialTypes,
   getTracksByType,
   isDryRun,
-  listSnapshots,
   loadDraft,
   loadedDraftStore,
-  readJournal,
   saveDraft,
   setDryRun,
   setForceWrite,
@@ -176,6 +176,7 @@ export const COMMANDS = [
 const HELP = `capcut-cli -- fast edits to CapCut projects
 
 Usage: capcut <command> <project> [options]
+       capcut <command> --help    One command's usage, options and exit codes
 
   <project> = path to draft_content.json, draft_info.json, or their parent directory
 
@@ -2945,7 +2946,8 @@ async function cmdTransition(draft: Draft, filePath: string, positional: string[
 }
 
 async function cmdMask(draft: Draft, filePath: string, positional: string[], flags: Flags): Promise<void> {
-  const { addMask, MASK_FIELDS, maskSlugs } = await import("./decorators.js");
+  const { addMask, maskSlugs } = await import("./decorators.js");
+  const { MASK_FIELDS } = await import("./mask-fields.js");
   const segId = positional[2];
   const slug = positional[3];
   const ns: Namespace = flags.jianying ? "jianying" : "capcut";
@@ -5043,26 +5045,28 @@ function getCliVersion(): string {
 // `restore` undoes writes. Plain form restores the most recent `.bak`. With
 // --list it shows the rolling snapshot history; with --step N it rolls back N
 // writes (step 1 == the .bak). Honors --dry-run (reports without copying).
-function cmdRestore(projectPath: string | undefined, flags: Flags): void {
+// Every restore first checks the file against the journal's before_sha256 and
+// refuses one that changed since the CLI wrote it (issue #151: the app
+// rewrites `.bak` when it saves); --force-write restores it anyway.
+async function cmdRestore(projectPath: string | undefined, flags: Flags): Promise<void> {
   if (!projectPath) die("Missing project path. Usage: capcut restore <project> [--step N | --list]");
+  const { readRecoveryHistory } = await import("./history-integrity.js");
   const filePath = findDraft(projectPath);
   const hasSynchronizedSiblings = discoverDraftStore(filePath).targets.length > 1;
-  const snaps = listSnapshots(filePath);
+  const history = readRecoveryHistory(filePath);
+  const snaps = history.snapshots;
 
   if (flags.list) {
     // Each step names the write it undoes when the journal has its index;
     // snapshots from before the journal (or with a torn line) list with nulls.
-    const journal = readJournal(filePath);
-    const snapshots = snaps.map((s) => {
-      const entry = journal.get(s.index);
-      return {
-        step: s.step,
-        path: s.path,
-        command: entry?.command ?? null,
-        argv: entry?.argv ?? null,
-        time: entry?.time ?? null,
-      };
-    });
+    const snapshots = snaps.map((s) => ({
+      step: s.step,
+      path: s.path,
+      command: s.entry?.command ?? null,
+      argv: s.entry?.argv ?? null,
+      time: s.entry?.time ?? null,
+      integrity: s.integrity,
+    }));
     out({ ok: true, count: snaps.length, snapshots }, flags);
     return;
   }
@@ -5087,8 +5091,15 @@ function cmdRestore(projectPath: string | undefined, flags: Flags): void {
       const avail = snaps.length ? `1..${snaps.length}` : "none yet";
       die(`No snapshot at --step ${flags.step}. Available: ${avail}. Try: capcut restore ${projectPath} --list`);
     }
+    if (target.integrity === "changed" && !flags.forceWrite) {
+      die(
+        `refused [snapshot-changed]: snapshot step ${flags.step} no longer holds what capcut-cli saved before that write ` +
+          "(it changed on disk afterwards; snapshots written before 0.30.0 share their bytes with the .bak the app rewrites on save). " +
+          `Check the others with: capcut restore ${projectPath} --list, or pass --force-write to restore it as it is now.`,
+      );
+    }
     if (!isDryRun()) restoreSource(target.path);
-    out({ ok: true, restored: filePath, from: target.path, step: flags.step }, flags);
+    out({ ok: true, restored: filePath, from: target.path, step: flags.step, integrity: target.integrity }, flags);
     return;
   }
 
@@ -5096,8 +5107,19 @@ function cmdRestore(projectPath: string | undefined, flags: Flags): void {
   if (!existsSync(bakPath)) {
     die(`No backup found at ${bakPath}. Nothing to restore (a .bak is written on the first edit).`);
   }
+  const integrity = history.backup();
+  if (integrity === "changed" && !flags.forceWrite) {
+    const step1 =
+      snaps[0]?.integrity === "intact"
+        ? ` Restore capcut-cli's own copy with: capcut restore ${projectPath} --step 1.`
+        : "";
+    die(
+      `refused [backup-changed]: ${bakPath} no longer holds what capcut-cli saved before its last write ` +
+        `(the app rewrites it when it saves).${step1} Pass --force-write to restore the .bak as it is now.`,
+    );
+  }
   if (!isDryRun()) restoreSource(bakPath);
-  out({ ok: true, restored: filePath, from: bakPath }, flags);
+  out({ ok: true, restored: filePath, from: bakPath, integrity }, flags);
 }
 
 // `prune` removes materials no segment references. The referenced set is the
@@ -5386,6 +5408,53 @@ function cmdDescribe(flags: Flags): void {
 
 function commandSpecs() {
   return buildCommandSpecs(COMMANDS, SUMMARIES);
+}
+
+// One command's help, rendered from the same registry as `describe` and the
+// generated command reference, so the three cannot disagree.
+function renderCommandHelp(spec: CommandSpec): string {
+  const lines = [`Usage: ${spec.usage}`, "", spec.summary];
+  const optionLabel = (option: OptionSpec): string => {
+    const value =
+      option.type === "boolean" ? "" : option.values ? ` <${option.values.join("|")}>` : ` <${option.type}>`;
+    return `${option.flags.join(", ")}${value}`;
+  };
+  if (spec.options.length > 0) {
+    const width = Math.min(34, Math.max(...spec.options.map((option) => optionLabel(option).length)));
+    lines.push("", "Options:");
+    for (const option of spec.options) {
+      const label = optionLabel(option);
+      const pad = label.length > width ? `\n  ${" ".repeat(width + 2)}` : " ".repeat(width - label.length + 2);
+      lines.push(`  ${label}${pad}${option.description ?? ""}`);
+    }
+  }
+  lines.push(
+    "",
+    `Global options: ${GLOBAL_OPTION_SPECS.flatMap((option) => option.flags).join(" ")}`,
+    `Output: ${spec.output.description}`,
+  );
+  if (spec.mutates) lines.push("Writes the draft: a .bak and a history snapshot are kept (capcut restore undoes it).");
+  if (spec.prerequisites.length > 0) lines.push(`Needs: ${spec.prerequisites.join(", ")}`);
+  lines.push(
+    `Exit codes: ${Object.entries(spec.exit_codes)
+      .map(([code, meaning]) => `${code} ${meaning}`)
+      .join("; ")}`,
+    `Machine-readable contract: capcut describe --command ${spec.name}`,
+  );
+  return lines.join("\n");
+}
+
+// `capcut help [<command>]` and `capcut <command> --help|-h`. The command is
+// the first argument that is not a flag; an unknown one gets the full help.
+function helpRequest(raw: string[]): { command: string | null } | null {
+  const first = raw.findIndex((arg) => !arg.startsWith("-"));
+  const wantsHelp = raw.includes("--help") || raw.includes("-h");
+  if (first >= 0 && raw[first] === "help") {
+    const named = raw.slice(first + 1).find((arg) => !arg.startsWith("-"));
+    return { command: named ?? null };
+  }
+  if (!wantsHelp) return null;
+  return { command: first >= 0 ? raw[first] : null };
 }
 
 // --- Config (.capcutrc) ---
@@ -6039,8 +6108,11 @@ async function cmdDetectRetakes(draft: Draft | null, flags: Flags): Promise<void
 
 async function main(): Promise<void> {
   const raw = process.argv.slice(2);
-  if (raw.length === 0 || raw[0] === "--help" || raw[0] === "-h") {
-    console.log(`${HELP}\n\nGenerated command index:\n${renderCommandIndex(commandSpecs())}`);
+  const help = raw.length === 0 ? { command: null } : helpRequest(raw);
+  if (help) {
+    const spec = help.command ? commandSpecs().find((candidate) => candidate.name === help.command) : undefined;
+    if (spec) console.log(renderCommandHelp(spec));
+    else console.log(`${HELP}\n\nGenerated command index:\n${renderCommandIndex(commandSpecs())}`);
     process.exit(0);
   }
 
@@ -6178,7 +6250,7 @@ async function main(): Promise<void> {
 
   // `restore` copies a backup/snapshot back over the draft — no loadDraft/parse needed.
   if (cmd === "restore") {
-    cmdRestore(projectPath, flags);
+    await cmdRestore(projectPath, flags);
     process.exit(0);
   }
 
